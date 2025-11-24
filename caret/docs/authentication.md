@@ -49,6 +49,7 @@
 - 사용자 호출: `v1/chat/completions`만 JWT 또는 API 키 허용(마스터 키도 가능).
 - 자기 정보: `/v1/auth/me` → JWT/API 키 허용, 마스터 키는 거부.
 - 관리자/운영: `keys`, `users`, `budgets` 관리 등 나머지 기존 라우터 → 마스터 키만 허용(필요 시 별도 관리자 JWT 추가 가능).
+- 프로필/사용량: `/v1/profile` → JWT/API 키/마스터 키 모두 허용. 마스터 키는 `user` 쿼리 파라미터로 대상 지정 필수.
 
 # 테이블/모델 요약
 - `api_keys`: `id`, `key_hash`, `key_name`, `user_id`, `expires_at`, `is_active`, `metadata`, `created_at`, `last_used_at`.
@@ -56,6 +57,7 @@
 - `budgets`: `budget_id`, `max_budget`, `budget_duration_sec`, 타임스탬프.
 - `caret_users`: `id`, `user_id` FK, `provider`, `provider_user_id`(유니크), `email`, `name`, `avatar_url`, `refresh_token?`, `access_token_expires_at`, `last_login_at`, `metadata`, 타임스탬프.
 - `session_tokens`: `id/jti`, `user_id`, `api_key_id`, `refresh_token_hash`, `refresh_expires_at`, `revoked_at`, `created_at`, `last_used_at`, `metadata`(디바이스/클라이언트 정보).
+- 프로필 API 사용량 집계: 기간별(`24h/7d/30d`) `requests`, `prompt_tokens`, `completion_tokens`, `total_tokens`, `cost` 합계 + 최근 로그 일부.
 
 # 보안/운영 주의
 - API 키 평문은 재노출 불가 → 분실 시 재발급/회전으로 대응.
