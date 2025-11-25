@@ -201,9 +201,8 @@ async def verify_jwt_or_api_key_or_master(
     try:
         payload = verify_access_token(token, config)
         jti = payload.get("jti")
-        api_key_id = payload.get("api_key_id")
         user_id = payload.get("sub")
-        if not jti or not api_key_id or not user_id:
+        if not jti or not user_id:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid access token payload",
@@ -217,22 +216,10 @@ async def verify_jwt_or_api_key_or_master(
             )
         _validate_session_token(db, session_token)
 
-        api_key = db.query(APIKey).filter(APIKey.id == api_key_id).first()
-        if not api_key or not api_key.is_active:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="API key for session is inactive or missing",
-            )
-        if api_key.expires_at and api_key.expires_at < datetime.now(UTC).replace(tzinfo=None):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="API key for session has expired",
-            )
-
         session_token.last_used_at = datetime.now(UTC)
         db.commit()
 
-        return api_key, False, str(user_id)
+        return None, False, str(user_id)
     except HTTPException:
         raise
     except Exception:

@@ -235,7 +235,6 @@ class SessionToken(Base):
 
     id: Mapped[str] = mapped_column(primary_key=True, default=lambda: str(uuid.uuid4()))
     user_id: Mapped[str] = mapped_column(ForeignKey("users.user_id", ondelete="CASCADE"), index=True)
-    api_key_id: Mapped[str] = mapped_column(ForeignKey("api_keys.id", ondelete="CASCADE"), index=True)
     refresh_token_hash: Mapped[str] = mapped_column(index=True, unique=True)
     refresh_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -244,14 +243,12 @@ class SessionToken(Base):
     metadata_: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, default=dict)
 
     user = relationship("User", back_populates="session_tokens")
-    api_key = relationship("APIKey")
 
     def to_dict(self) -> dict[str, Any]:
         """Convert model to dictionary."""
         return {
             "id": self.id,
             "user_id": self.user_id,
-            "api_key_id": self.api_key_id,
             "refresh_token_hash": self.refresh_token_hash,
             "refresh_expires_at": self.refresh_expires_at.isoformat() if self.refresh_expires_at else None,
             "revoked_at": self.revoked_at.isoformat() if self.revoked_at else None,

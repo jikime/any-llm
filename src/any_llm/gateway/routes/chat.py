@@ -16,6 +16,7 @@ from any_llm.gateway.budget import validate_user_budget
 from any_llm.gateway.config import GatewayConfig
 from any_llm.gateway.db import APIKey, ModelPricing, UsageLog, User, get_db
 from any_llm.gateway.log_config import logger
+from any_llm.gateway.routes.utils import resolve_target_user
 from any_llm.types.completion import ChatCompletion, ChatCompletionChunk, CompletionUsage
 
 router = APIRouter(prefix="/v1/chat", tags=["chat"])
@@ -160,32 +161,12 @@ async def chat_completions(
     - API key + user field: Use specified user (must exist)
     - API key without user field: Use virtual user created with API key
     """
-    api_key, is_master_key, resolved_user_id = auth_result
-
-    user_id: str
-    if is_master_key:
-        if not request.user:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="When using master key, 'user' field is required in request body",
-            )
-        user_id = request.user
-    elif resolved_user_id:
-        user_id = resolved_user_id
-    elif request.user:
-        user_id = request.user
-    else:
-        if api_key is None:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="API key validation failed",
-            )
-        if not api_key.user_id:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="API key has no associated user",
-            )
-        user_id = str(api_key.user_id)
+    api_key, _, _ = auth_result
+    user_id = resolve_target_user(
+        auth_result,
+        request.user,
+        missing_master_detail="When using master key, 'user' field is required in request body",
+    )
 
     _ = await validate_user_budget(db, user_id)
 

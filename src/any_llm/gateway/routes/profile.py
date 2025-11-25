@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from any_llm.gateway.auth import verify_jwt_or_api_key_or_master
 from any_llm.gateway.db import APIKey, Budget, CaretUser, UsageLog, User, get_db
+from any_llm.gateway.routes.utils import resolve_target_user
 
 router = APIRouter(prefix="/v1/profile", tags=["profile"])
 
@@ -145,23 +146,6 @@ def _ensure_naive(dt: datetime) -> datetime:
     return dt
 
 
-def _resolve_target_user(auth_result: tuple[APIKey | None, bool, str | None], user_param: str | None) -> str:
-    """Resolve target user_id from auth and optional query."""
-    api_key, is_master, resolved_user_id = auth_result
-    if is_master:
-        if not user_param:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="When using master key, 'user' query parameter is required",
-            )
-        return user_param
-
-    target_user_id = resolved_user_id or (api_key.user_id if api_key else None)
-    if not target_user_id:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not resolved")
-    return target_user_id
-
-
 def _aggregate_usage(db: Session, user_id: str, since: datetime) -> UsageWindow:
     """기간별 사용량 합계."""
     requests_count, prompt_sum, completion_sum, total_sum, cost_sum = (
@@ -220,7 +204,11 @@ async def get_profile(
     recent_limit: int = Query(10, ge=0, le=100, description="최근 사용 로그 개수"),
 ) -> ProfileResponse:
     """프로필 + 예산 + 사용량 집계 반환."""
-    target_user_id = _resolve_target_user(auth_result, user)
+    target_user_id = resolve_target_user(
+        auth_result,
+        user,
+        missing_master_detail="When using master key, 'user' query parameter is required",
+    )
     user_obj = db.query(User).filter(User.user_id == target_user_id).first()
     if not user_obj:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"User '{target_user_id}' not found")
@@ -282,7 +270,11 @@ async def get_profile_usage(
     group_by: Literal["day", "week", "total"] = Query("day", description="집계 단위"),
 ) -> UsageBucketsResponse:
     """사용량 집계(기간별)."""
-    target_user_id = _resolve_target_user(auth_result, user)
+    target_user_id = resolve_target_user(
+        auth_result,
+        user,
+        missing_master_detail="When using master key, 'user' query parameter is required",
+    )
 
     now = _now_naive()
     start_dt = _ensure_naive(start) if start else now - timedelta(days=30)
@@ -378,7 +370,11 @@ async def list_profile_keys(
     user: str | None = Query(None, description="마스터 키 사용 시 조회할 user_id"),
 ) -> list[KeySummary]:
     """사용자의 API 키 메타 조회(평문 키 미노출)."""
-    target_user_id = _resolve_target_user(auth_result, user)
+    target_user_id = resolve_target_user(
+        auth_result,
+        user,
+        missing_master_detail="When using master key, 'user' query parameter is required",
+    )
 
     keys = (
         db.query(APIKey)
@@ -425,7 +421,11 @@ async def list_profile_logs(
     max_cost: float | None = Query(None),
 ) -> LogsResponse:
     """사용자 로그 목록(필터/페이지네이션)."""
-    target_user_id = _resolve_target_user(auth_result, user)
+    target_user_id = resolve_target_user(
+        auth_result,
+        user,
+        missing_master_detail="When using master key, 'user' query parameter is required",
+    )
 
     start_dt = _ensure_naive(start) if start else None
     end_dt = _ensure_naive(end) if end else None

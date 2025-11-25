@@ -32,7 +32,7 @@
 
 ## API 호출
 - `X-AnyLLM-Key`에 access JWT 또는 API 키를 전달.
-- 공통 의존성(예: `verify_jwt_or_api_key_or_master`)에서 토큰 타입 판별 → `api_key_id`·`user_id` 확보 → 예산/사용량 로깅에 사용.
+- 공통 의존성(예: `verify_jwt_or_api_key_or_master`)에서 토큰 타입 판별 → `user_id` 확보 → 예산/사용량 로깅에 사용.
 - 마스터 키 사용 시 `user` 필드를 별도로 요구(누적 대상 명시).
 
 ## 토큰 갱신 (선제 갱신 권장)

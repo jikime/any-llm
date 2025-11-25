@@ -46,18 +46,15 @@ def upgrade() -> None:
         "session_tokens",
         sa.Column("id", sa.String(), nullable=False),
         sa.Column("user_id", sa.String(), nullable=False),
-        sa.Column("api_key_id", sa.String(), nullable=False),
         sa.Column("refresh_token_hash", sa.String(), nullable=False),
         sa.Column("refresh_expires_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("revoked_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("last_used_at", sa.DateTime(timezone=True), nullable=True),
-        sa.ForeignKeyConstraint(["api_key_id"], ["api_keys.id"], ondelete="CASCADE"),
         sa.ForeignKeyConstraint(["user_id"], ["users.user_id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("refresh_token_hash", name="uq_session_tokens_refresh_hash"),
     )
-    op.create_index(op.f("ix_session_tokens_api_key_id"), "session_tokens", ["api_key_id"], unique=False)
     op.create_index(op.f("ix_session_tokens_refresh_token_hash"), "session_tokens", ["refresh_token_hash"], unique=False)
     op.create_index(op.f("ix_session_tokens_user_id"), "session_tokens", ["user_id"], unique=False)
 
@@ -66,7 +63,6 @@ def downgrade() -> None:
     """Downgrade schema."""
     op.drop_index(op.f("ix_session_tokens_user_id"), table_name="session_tokens")
     op.drop_index(op.f("ix_session_tokens_refresh_token_hash"), table_name="session_tokens")
-    op.drop_index(op.f("ix_session_tokens_api_key_id"), table_name="session_tokens")
     op.drop_table("session_tokens")
 
     op.drop_index(op.f("ix_caret_users_user_id"), table_name="caret_users")

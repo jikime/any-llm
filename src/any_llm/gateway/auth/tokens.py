@@ -31,7 +31,6 @@ def generate_refresh_token() -> str:
 def sign_access_token(
     *,
     user_id: str,
-    api_key_id: str,
     config: GatewayConfig,
     jti: str,
     expires_minutes: int | None = None,
@@ -41,7 +40,6 @@ def sign_access_token(
     now = datetime.now(UTC)
     payload: dict[str, Any] = {
         "sub": user_id,
-        "api_key_id": api_key_id,
         "jti": jti,
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(minutes=exp_minutes)).timestamp()),

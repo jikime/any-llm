@@ -20,7 +20,6 @@ class SocialLoginRequest(BaseModel):
     """소셜 로그인 요청."""
 
     provider: str = Field(description="소셜 프로바이더 식별자 (예: google, kakao)")
-    access_token: str = Field(description="소셜 프로바이더에서 발급받은 액세스 토큰 또는 id_token")
     email: str | None = Field(default=None, description="사용자 이메일(프로바이더에서 확보한 값, 없으면 None)")
     name: str | None = Field(default=None, description="사용자 이름/닉네임(없으면 None)")
     avatar_url: str | None = Field(default=None, description="사용자 아바타 이미지 URL(없으면 None)")
@@ -73,7 +72,6 @@ class MeResponse(BaseModel):
 
     profile: dict[str, Any]
     budget: BudgetInfo | None
-    api_key_id: str | None
 
 
 def _normalize_profile(request: SocialLoginRequest) -> dict[str, Any]:
@@ -130,12 +128,11 @@ def _issue_tokens(
     config: GatewayConfig,
     db: Session,
     user_id: str,
-    api_key_id: str,
     metadata: dict[str, Any] | None = None,
 ) -> tuple[str, str, datetime, datetime]:
     """access/refresh 토큰 발급 + 세션 저장."""
     jti = str(uuid.uuid4())
-    access_token = sign_access_token(user_id=user_id, api_key_id=api_key_id, config=config, jti=jti)
+    access_token = sign_access_token(user_id=user_id, config=config, jti=jti)
 
     refresh_token = generate_refresh_token()
     refresh_hash = hash_token(refresh_token)
@@ -145,7 +142,6 @@ def _issue_tokens(
     session = SessionToken(
         id=jti,
         user_id=user_id,
-        api_key_id=api_key_id,
         refresh_token_hash=refresh_hash,
         refresh_expires_at=refresh_exp,
         created_at=now,
@@ -196,7 +192,7 @@ async def social_login(
         db.add(user)
         db.flush()
 
-        api_key, raw_api_key = _get_or_create_api_key(db, user.user_id, allow_create=True)
+        # api_key, raw_api_key = _get_or_create_api_key(db, user.user_id, allow_create=True)
 
         caret_user = CaretUser(
             user_id=user.user_id,
@@ -218,7 +214,6 @@ async def social_login(
         config,
         db,
         user.user_id,
-        api_key.id,
         metadata=profile.get("device"),
     )
     db.commit()
@@ -255,10 +250,6 @@ async def refresh_token(
     if session.refresh_expires_at and session.refresh_expires_at < now:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token expired")
 
-    api_key = db.query(APIKey).filter(APIKey.id == session.api_key_id).first()
-    if not api_key or not api_key.is_active:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="API key inactive")
-
     # Rotate refresh token
     session.revoked_at = now
 
@@ -269,7 +260,6 @@ async def refresh_token(
     new_session = SessionToken(
         id=str(uuid.uuid4()),
         user_id=session.user_id,
-        api_key_id=session.api_key_id,
         refresh_token_hash=new_refresh_hash,
         refresh_expires_at=refresh_exp,
         created_at=now,
@@ -280,7 +270,6 @@ async def refresh_token(
 
     access_token = sign_access_token(
         user_id=session.user_id,
-        api_key_id=session.api_key_id,
         config=config,
         jti=new_session.id,
     )
@@ -315,7 +304,7 @@ async def logout(
 
 @router.get("/me")
 async def me(
-    auth_result: Annotated[tuple[APIKey | None, bool, str | None], Depends(verify_jwt_or_api_key_or_master)],
+    auth_result: Annotated[tuple[bool, str | None], Depends(verify_jwt_or_api_key_or_master)],
     db: Annotated[Session, Depends(get_db)],
 ) -> MeResponse:
     """내 정보 조회 (JWT/API 키)."""
@@ -323,8 +312,7 @@ async def me(
     if is_master:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Master key is not allowed")
 
-    resolved_user_id = user_id or (api_key.user_id if api_key else None)
-    if not resolved_user_id:
+    if not user_id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not resolved")
 
     user = db.query(User).filter(User.user_id == resolved_user_id).first()
@@ -360,5 +348,4 @@ async def me(
             if budget
             else None
         ),
-        api_key_id=api_key.id if api_key else None,
     )
