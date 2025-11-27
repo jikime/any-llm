@@ -14,6 +14,7 @@ from any_llm.gateway.auth.dependencies import get_config
 from any_llm.gateway.auth.tokens import generate_refresh_token, hash_token, sign_access_token
 from any_llm.gateway.config import GatewayConfig
 from any_llm.gateway.db import APIKey, Budget, CaretUser, SessionToken, User, get_db
+from any_llm.gateway.log_config import logger
 
 router = APIRouter(prefix="/v1/auth", tags=["auth"])
 
@@ -31,13 +32,14 @@ class SocialLoginRequest(BaseModel):
     app_version: str | None = Field(default=None, description="앱/클라이언트 버전")
     user_agent: str | None = Field(default=None, description="브라우저/클라이언트 UA")
     ip: str | None = Field(default=None, description="클라이언트 IP(서버에서 주입 가능)")
+    provider_token: str | None = Field(default=None, description="소셜 프로바이더 토큰")
     metadata: dict[str, Any] = Field(default_factory=dict, description="추가 메타데이터")
 
 
 class RefreshRequest(BaseModel):
     """토큰 갱신 요청."""
 
-    refresh_token: str
+    refreshToken: str
 
 
 class TokenRequest(BaseModel):
@@ -50,11 +52,14 @@ class TokenRequest(BaseModel):
 
 class TokenResponse(BaseModel):
     """토큰 교환 응답."""
-
-    access_token: str
-    refresh_token: str
-    expires_at: str | None = None
-    user_info: dict[str, Any] | None = None
+    success: bool
+    data: dict[str, Any] = {
+      "accessToken": str,
+      "refreshToken": str,
+      "expiresAt": str | None,
+      "userInfo": dict[str, Any] | None,
+      "tokenType": str | None,
+    }
 
 class LogoutRequest(BaseModel):
     """로그아웃 요청."""
@@ -88,13 +93,16 @@ class LoginResponse(BaseModel):
 class MeResponse(BaseModel):
     """내 정보 응답."""
 
-    id: str
-    email: str
-    displayName: str
-    photoUrl: str
-    createdAt: str
-    updatedAt: str
-    organizations: list[dict[str, Any]]
+    success: bool
+    data: dict[str, Any] = {  
+      "id": str,
+      "email": str,
+      "displayName": str,
+      "photoUrl": str,
+      "createdAt": str,
+      "updatedAt": str,
+      "organizations": list[dict[str, Any]]
+    }
 
 
 class AuthorizeResponse(BaseModel):
@@ -113,6 +121,7 @@ def _normalize_profile(request: SocialLoginRequest) -> dict[str, Any]:
         "email": request.email,
         "name": request.name,
         "avatar_url": request.avatar_url,
+        "provider_token": request.provider_token,
         "metadata": request.metadata or {},
         "device": {
             "device_type": request.device_type or "web",
@@ -193,22 +202,64 @@ def jwt_exp(token: str) -> int:
     return int(payload["exp"])
 
 
+def _ensure_free_plan_and_balance(db: Session, user_id: str, now: datetime) -> None:
+    """신규 사용자 기본 구독/크레딧 생성."""
+    start_at = now
+    renew_at = now + timedelta(days=30)
+
+    db.execute(
+        text(
+            """
+            INSERT INTO billing_subscription_plans
+                (id, user_id, plan_code, status, credits_per_month, price_cents, currency, start_at, renew_at, ends_at, created_at, updated_at)
+            VALUES
+                (:id, :user_id, 'FREE', 'ACTIVE', 10, 0, 'USD', :start_at, :renew_at, :renew_at, :created_at, :updated_at)
+            ON CONFLICT (user_id) DO NOTHING
+            """
+        ),
+        {
+            "id": str(uuid.uuid4()),
+            "user_id": user_id,
+            "start_at": start_at,
+            "renew_at": renew_at,
+            "created_at": now,
+            "updated_at": now,
+        },
+    )
+    db.execute(
+        text(
+            """
+            INSERT INTO billing_credit_balances
+                (user_id, total_credits, used_credits, subscription_credits, extra_credits, gift_subscription_credits, gift_extra_credits, currency, created_at, updated_at)
+            VALUES
+                (:user_id, 10, 0, 10, 0, 0, 0, 'USD', :created_at, :updated_at)
+            ON CONFLICT (user_id) DO NOTHING
+            """
+        ),
+        {
+            "user_id": user_id,
+            "created_at": now,
+            "updated_at": now,
+        },
+    )
+
+
 @router.get("/authorize", response_model=AuthorizeResponse)
 async def authorize(
     callback_url: Annotated[str, Query(..., description="로그인 후 돌아올 콜백 URL (예: vscode://caretive.caret/auth)")],
-    client_type: Annotated[str, Query(default="extension", description="클라이언트 유형")] = "extension",
-    redirect_uri: Annotated[str | None, Query(default=None, description="명시적 리디렉션 URI (없으면 callback_url 사용)")] = None,
+    client_type: Annotated[str, Query(description="클라이언트 유형")] = "extension",
+    redirect_uri: Annotated[str | None, Query(description="명시적 리디렉션 URI (없으면 callback_url 사용)")] = None,
 ) -> AuthorizeResponse:
     """인가 리디렉트 URL을 생성해 반환."""
     if not callback_url:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="callback_url is required")
 
-    base = "https://caret.team"
+    base = "http://localhost:4001"
     params = {
         "client_type": client_type or "extension",
         "callback_url": callback_url,
     }
-    redirect_url = f"{base}/auth?{urlencode(params)}"
+    redirect_url = f"{base}/login?{urlencode(params)}"
     return AuthorizeResponse(redirect_url=redirect_url)
 
 
@@ -243,6 +294,7 @@ async def exchange_token(
         "email": caret_row.email if caret_row else "",
         "name": caret_row.name if caret_row else "",
         "subject": caret_row.provider if caret_row else "",
+        "accounts": [],
     }
 
     try:
@@ -252,10 +304,14 @@ async def exchange_token(
         expires_at = None
 
     return TokenResponse(
-        access_token=token_row.access_token_plain,
-        refresh_token=token_row.refresh_token_plain,
-        expires_at=expires_at,
-        user_info=user_info,
+        success=True,
+        data={
+            "accessToken": token_row.access_token_plain,
+            "refreshToken": token_row.refresh_token_plain,
+            "tokenType": "Bearer",
+            "expiresAt": expires_at,
+            "userInfo": user_info,
+        },
     )
 
 
@@ -281,14 +337,15 @@ async def social_login(
         db.add(budget)
         db.flush()
 
+        now = datetime.now(UTC)
         user = User(
             user_id=str(uuid.uuid4()),
             alias=profile.get("name"),
             budget_id=budget.budget_id,
             blocked=False,
             metadata_=request.metadata,
-            budget_started_at=datetime.now(UTC),
-            next_budget_reset_at=datetime.now(UTC) + timedelta(days=30),
+            budget_started_at=now,
+            next_budget_reset_at=now + timedelta(days=30),
         )
         db.add(user)
         db.flush()
@@ -306,21 +363,19 @@ async def social_login(
             last_login_at=datetime.now(UTC),
         )
         db.add(caret_user)
+
+        _ensure_free_plan_and_balance(db, user.user_id, now)
     else:
         user = db.query(User).filter(User.user_id == caret_user.user_id).first()
         if not user:
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Linked user missing")
-
-    provider_token = None
-    if request.metadata:
-        provider_token = request.metadata.get("provider_token")
 
     access_token, refresh_token, access_exp, refresh_exp = _issue_tokens(
         config,
         db,
         user.user_id,
         metadata=profile.get("device"),
-        provider_token=provider_token,
+        provider_token=profile.get("provider_token"),
     )
     db.commit()
 
@@ -341,7 +396,7 @@ async def refresh_token(
     config: Annotated[GatewayConfig, Depends(get_config)],
 ) -> TokenResponse:
     """Access/refresh 토큰 재발급."""
-    refresh_hash = hash_token(request.refresh_token)
+    refresh_hash = hash_token(request.refreshToken)
     session = (
         db.query(SessionToken, CaretUser)
         .join(User, User.user_id == SessionToken.user_id)
@@ -394,13 +449,18 @@ async def refresh_token(
         "email": caret_row.email if caret_row else "",
         "name": caret_row.name if caret_row else "",
         "subject": caret_row.provider if caret_row else "",
+        "accounts": [],
     }
 
     return TokenResponse(
-        access_token=access_token,
-        refresh_token=new_refresh,
-        expires_at=access_exp.isoformat(),
-        user_info=user_info,
+        success=True,
+        data={
+            "accessToken": access_token,
+            "refreshToken": new_refresh,
+            "tokenType": "Bearer",
+            "expiresAt": access_exp.isoformat(),
+            "userInfo": user_info,
+        },
     )
 
 
@@ -427,7 +487,9 @@ async def me(
     db: Annotated[Session, Depends(get_db)],
 ) -> MeResponse:
     """내 정보 조회 (JWT/API 키)."""
-    api_key, is_master, user_id = auth_result
+    api_key, is_master, user_id, _ = auth_result
+    logger.warning(f"User ID: {user_id}")
+
     if is_master:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Master key is not allowed")
 
@@ -442,11 +504,14 @@ async def me(
     caret_user = db.query(CaretUser).filter(CaretUser.user_id == resolved_user_id).first()
 
     return MeResponse(
-        id=caret_user.id,
-        email=caret_user.email,
-        displayName=caret_user.name,
-        photoUrl=caret_user.avatar_url,
-        createdAt=caret_user.created_at.isoformat(),
-        updatedAt=caret_user.updated_at.isoformat(),
-        organizations=[],
-    )
+            success=True,
+            data={
+              "id":caret_user.id,
+              "email":caret_user.email,
+              "displayName":caret_user.name,
+              "photoUrl":caret_user.avatar_url,
+              "createdAt":caret_user.created_at.isoformat(),
+              "updatedAt":caret_user.updated_at.isoformat(),
+              "organizations": [],
+            }
+        )

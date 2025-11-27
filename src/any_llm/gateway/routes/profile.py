@@ -10,6 +10,7 @@ from any_llm.gateway.auth import verify_jwt_or_api_key_or_master
 from any_llm.gateway.db import APIKey, Budget, CaretUser, SessionToken, UsageLog, User, get_db
 from sqlalchemy import text
 from any_llm.gateway.routes.utils import resolve_target_user
+from any_llm.gateway.log_config import logger
 
 router = APIRouter(prefix="/v1/profile", tags=["profile"])
 
@@ -133,13 +134,15 @@ class LogsResponse(BaseModel):
     total: int
     items: list[LogItem]
 
+class Balance(BaseModel):
+    """크레딧 잔액."""
+    userId: str
+    balance: float
 
 class BalanceResponse(BaseModel):
     """크레딧 잔액 응답."""
-
-    user_id: str
-    total_credits: float
-
+    success: bool
+    data: Balance
 
 @router.get("/balance", response_model=BalanceResponse)
 async def get_balance(
@@ -147,36 +150,39 @@ async def get_balance(
     db: Annotated[Session, Depends(get_db)],
 ) -> BalanceResponse:
     """현재 사용자의 크레딧 잔액을 반환."""
-    api_key, is_master, resolved_user_id, session_token = auth_result
     target_user_id = resolve_target_user(
-        (api_key, is_master, resolved_user_id),
+        auth_result,
         None,
         missing_master_detail="When using master key, user resolution failed",
     )
 
-    row = (
-        db.query(func.coalesce(func.sum(func.cast(User.spend, Float)), 0).label("spend"))
-        .filter(User.user_id == target_user_id)
-        .one_or_none()
-    )
+    # row = (
+    #     db.query(func.coalesce(func.sum(func.cast(User.spend, Float)), 0).label("spend"))
+    #     .filter(User.user_id == target_user_id)
+    #     .one_or_none()
+    # )
 
     # billing_credit_balances.total_credits를 우선, 없으면 spend 기준 0
-    balance_row = (
-        db.execute(
+    balance_row = db.execute(
+        text(
             """
             SELECT total_credits
             FROM billing_credit_balances
             WHERE user_id = :uid
-            """,
-            {"uid": target_user_id},
-        ).fetchone()
-    )
+            """
+        ),
+        {"uid": target_user_id},
+    ).fetchone()
 
     total_credits = float(balance_row[0]) if balance_row and balance_row[0] is not None else 0.0
+    logger.info(f"User {target_user_id} balance: {total_credits}")
 
     return BalanceResponse(
-        user_id=target_user_id,
-        total_credits=total_credits,
+        success=True,
+        data=Balance(
+            userId=target_user_id,
+            balance=total_credits * 100 * 1000, # micro dollors
+        ),
     )
 
 
@@ -249,9 +255,8 @@ async def get_profile(
     user: str | None = Query(None, description="마스터 키 사용 시 조회할 user_id"),
 ) -> ProfileResponse:
     """프로필 + 예산 + 사용량 집계 반환."""
-    api_key, is_master, resolved_user_id, session_token = auth_result
     target_user_id = resolve_target_user(
-        (api_key, is_master, resolved_user_id),
+        auth_result,
         user,
         missing_master_detail="When using master key, 'user' query parameter is required",
     )
@@ -303,7 +308,7 @@ async def get_profile_usage(
 ) -> UsageBucketsResponse:
     """사용량 집계(기간별)."""
     target_user_id = resolve_target_user(
-        auth_result[:3],
+        auth_result,
         user,
         missing_master_detail="When using master key, 'user' query parameter is required",
     )
@@ -403,7 +408,7 @@ async def list_profile_keys(
 ) -> list[KeySummary]:
     """사용자의 API 키 메타 조회(평문 키 미노출)."""
     target_user_id = resolve_target_user(
-        auth_result[:3],
+        auth_result,
         user,
         missing_master_detail="When using master key, 'user' query parameter is required",
     )
@@ -430,7 +435,7 @@ async def list_profile_keys(
     ]
 
 
-class ProfileLogResponse(BaseModel):
+class ProfileLog(BaseModel):
     aiInferenceProviderName: str
     aiModelName: str
     aiModelTypeName: str
@@ -446,6 +451,12 @@ class ProfileLogResponse(BaseModel):
     totalTokens: int
     userId: str
 
+class ProfileLogResponse(BaseModel):
+    success: bool
+    data: dict[str, Any] = {
+        "items": list[ProfileLog]
+    }
+
 
 class PaymentRecord(BaseModel):
     paidAt: str
@@ -453,12 +464,17 @@ class PaymentRecord(BaseModel):
     amountCents: int
     credits: int
 
+class PaymentResponse(BaseModel):
+    success: bool
+    data: dict[str, Any] = {
+        "paymentTransactions": list[PaymentRecord]
+    }
 
 @router.get("/logs")
 async def list_profile_logs(
     auth_result: Annotated[tuple[APIKey | None, bool, str | None, SessionToken | None], Depends(verify_jwt_or_api_key_or_master)],
     db: Annotated[Session, Depends(get_db)],
-) -> list[ProfileLogResponse]:
+) -> ProfileLogResponse:
     """현재 날짜 기준 최근 7일 로그(최대 100건, 필터 없음)."""
     target_user_id = resolve_target_user(
         auth_result,
@@ -477,32 +493,37 @@ async def list_profile_logs(
         .all()
     )
 
-    return [
-        ProfileLogResponse(
-            aiInferenceProviderName=log.provider or "",
-            aiModelName=log.model or "",
-            aiModelTypeName="",
-            completionTokens=log.completion_tokens or 0,
-            costUsd=log.cost or 0.0,
-            createdAt=log.timestamp.isoformat() if log.timestamp else "",
-            creditsUsed=(log.cost or 0.0) * 10,
-            generationId=log.id or "",
-            id=log.id or "",
-            metadata={},
-            organizationId="",
-            promptTokens=log.prompt_tokens or 0,
-            totalTokens=log.total_tokens or 0,
-            userId=log.user_id or "",
-        )
-        for log in logs
-    ]
+    return ProfileLogResponse(
+        success=True,
+        data={
+            "items": [
+              ProfileLog(
+                  aiInferenceProviderName=log.provider or "",
+                  aiModelName=log.model or "",
+                  aiModelTypeName="",
+                  completionTokens=log.completion_tokens or 0,
+                  costUsd=log.cost or 0.0,
+                  createdAt=log.timestamp.isoformat() if log.timestamp else "",
+                  creditsUsed=(log.cost or 0.0) * 1000000, # micro
+                  generationId=log.id or "",
+                  id=log.id or "",
+                  metadata={},
+                  organizationId="",
+                  promptTokens=log.prompt_tokens or 0,
+                  totalTokens=log.total_tokens or 0,
+                  userId=log.user_id or "",
+              )
+              for log in logs
+          ]
+        }
+      )
 
 
 @router.get("/payments")
 async def list_profile_payments(
     auth_result: Annotated[tuple[APIKey | None, bool, str | None, SessionToken | None], Depends(verify_jwt_or_api_key_or_master)],
     db: Annotated[Session, Depends(get_db)],
-) -> list[PaymentRecord]:
+) -> PaymentResponse:
     """현재 사용자 결제 이력(청구 인보이스 기반) 반환."""
     target_user_id = resolve_target_user(
         auth_result,
@@ -537,4 +558,9 @@ async def list_profile_payments(
             )
         )
 
-    return payments
+    return PaymentResponse(
+      success=True,
+      data={
+        "paymentTransactions": payments
+      }
+    )

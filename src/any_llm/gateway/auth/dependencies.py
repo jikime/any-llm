@@ -9,6 +9,7 @@ from any_llm.gateway.auth.models import hash_key
 from any_llm.gateway.auth.tokens import verify_access_token
 from any_llm.gateway.config import API_KEY_HEADER, GatewayConfig
 from any_llm.gateway.db import APIKey, SessionToken, get_db
+from any_llm.gateway.log_config import logger
 
 _config: GatewayConfig | None = None
 
@@ -29,6 +30,7 @@ def get_config() -> GatewayConfig:
 
 def _extract_bearer_token(request: Request, config: GatewayConfig) -> str:
     """Extract and validate Bearer token from request header."""
+    logger.info("request.headers", request.headers)
     x_anyllm_key = request.headers.get(API_KEY_HEADER)
 
     if not x_anyllm_key:
