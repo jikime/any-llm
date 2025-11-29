@@ -1,9 +1,34 @@
+from datetime import UTC, datetime
 from typing import Any, Tuple
 
 from fastapi import HTTPException, status
+from sqlalchemy import func
+from sqlalchemy.orm import Session
 
-from any_llm.gateway.db import APIKey, SessionToken
+from any_llm.gateway.db import (
+    APIKey,
+    BillingPlan,
+    BillingSubscription,
+    CreditBalance,
+    CreditCharge,
+    ModelPricing,
+    SessionToken,
+)
+from any_llm.gateway.log_config import logger
 
+CREDITS_PER_USD_DEFAULT = 10.0
+
+
+def _estimate_cost_usd(
+    pricing: ModelPricing,
+    prompt_tokens: int,
+    completion_tokens: int,
+) -> float:
+    """Convert prompt/completion counts to USD using pricing."""
+    return (
+        (prompt_tokens / 1_000_000) * pricing.input_price_per_million
+        + (completion_tokens / 1_000_000) * pricing.output_price_per_million
+    )
 
 def resolve_target_user(
     auth_result: Tuple[APIKey | None, bool, str | None, SessionToken | None],
@@ -26,3 +51,156 @@ def resolve_target_user(
     if not target_user_id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not resolved")
     return target_user_id
+
+
+def validate_user_credit(db: Session, user_id: str) -> None:
+    """Ensure user has available (non-expired) credits; expire stale pools on the fly."""
+    # Expire stale pools in one UPDATE to avoid loading all rows.
+    db.execute(
+        CreditBalance.__table__.update()
+        .where(CreditBalance.user_id == user_id)
+        .where(CreditBalance.expires_at.isnot(None))
+        .where(CreditBalance.expires_at <= func.now())
+        .where(CreditBalance.amount != 0),
+        execution_options={"synchronize_session": False},
+    )
+    db.commit()
+
+    available = db.query(func.coalesce(func.sum(CreditBalance.amount), 0)).filter(
+        CreditBalance.user_id == user_id,
+        (CreditBalance.expires_at.is_(None)) | (CreditBalance.expires_at > func.now()),
+    ).scalar() or 0
+
+    if available <= 0:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient credits")
+
+
+def get_user_credits_per_usd(db: Session, user_id: str) -> float:
+    """Fetch credits_per_usd from the user's active billing plan, fallback to default."""
+    result = (
+        db.query(BillingPlan.credits_per_usd)
+        .join(BillingSubscription, BillingSubscription.plan_id == BillingPlan.id)
+        .filter(
+            BillingSubscription.user_id == user_id,
+            BillingSubscription.status == "ACTIVE",
+        )
+        .scalar()
+    )
+    return float(result) if result is not None else CREDITS_PER_USD_DEFAULT
+
+
+def charge_user_credits(
+    db: Session,
+    user_id: str,
+    *,
+    cost_usd: float,
+    credits_per_usd: float = CREDITS_PER_USD_DEFAULT,
+    model_key: str | None = None,
+    unit_price_usd: float | None = None,
+    usage_id: str | None = None,
+    currency: str = "USD",
+) -> float:
+    """Deduct credits according to priority/expires_at and record credit_charges."""
+    if cost_usd < 0:
+        msg = "cost_usd must be non-negative"
+        raise ValueError(msg)
+    needed_credits = cost_usd * credits_per_usd
+    if needed_credits <= 0:
+        return 0.0
+
+    # Lock rows to avoid race; ordered by priority ASC, expires_at ASC NULLS LAST.
+    balances = (
+        db.query(CreditBalance)
+        .filter(
+            CreditBalance.user_id == user_id,
+            (CreditBalance.expires_at.is_(None)) | (CreditBalance.expires_at > func.now()),
+            CreditBalance.amount > 0,
+        )
+        .order_by(CreditBalance.priority.asc(), CreditBalance.expires_at.is_(None), CreditBalance.expires_at.asc())
+        .with_for_update(skip_locked=True)
+        .all()
+    )
+
+    remaining = needed_credits
+    charges: list[CreditCharge] = []
+
+    for bal in balances:
+        if remaining <= 0:
+            break
+        take = min(bal.amount, remaining)
+        bal.amount -= take
+        remaining -= take
+        charges.append(
+            CreditCharge(
+                user_id=user_id,
+                pool_id=bal.id,
+                debited_amount=take,
+                cost_usd=cost_usd,
+                credits_per_usd=credits_per_usd,
+                model_key=model_key,
+                unit_price_usd=unit_price_usd,
+                usage_id=usage_id,
+                currency=currency,
+            )
+        )
+
+    charged_credits = needed_credits - remaining
+    if remaining > 0:
+        logger.warning(
+            "Insufficient credits to fully charge usage",
+            extra={
+                "user_id": user_id,
+                "needed_credits": needed_credits,
+                "charged_credits": charged_credits,
+                "shortage": remaining,
+                "model_key": model_key,
+            },
+        )
+    for charge in charges:
+        db.add(charge)
+    db.commit()
+    return charged_credits
+
+
+
+def charge_usage_cost(
+    db: Session,
+    user_id: str,
+    *,
+    usage: Any,
+    model_key: str | None,
+    usage_id: str | None = None,
+    currency: str = "USD",
+) -> float:
+    """usage(토큰)와 ModelPricing을 가져와 비용을 계산하고 크레딧을 차감한다."""
+    if not usage or not model_key:
+        return 0.0
+
+    pricing = db.query(ModelPricing).filter(ModelPricing.model_key == model_key).first()
+    if not pricing:
+        logger.warning(f"No pricing configured for model '{model_key}'. Skipping credit charge.")
+        return 0.0
+
+    prompt = getattr(usage, "prompt_tokens", 0) or 0
+    completion = getattr(usage, "completion_tokens", 0) or 0
+    cost_usd = _estimate_cost_usd(pricing, prompt, completion)
+
+    if cost_usd <= 0:
+        return 0.0
+
+    try:
+        credits_per_usd = get_user_credits_per_usd(db, user_id)
+        charge_user_credits(
+            db,
+            user_id=user_id,
+            cost_usd=cost_usd,
+            credits_per_usd=credits_per_usd,
+            model_key=model_key,
+            unit_price_usd=None,
+            usage_id=usage_id,
+            currency=currency,
+        )
+    except Exception as e:
+        logger.warning("Credit charge failed", extra={"user_id": user_id, "model_key": model_key, "error": str(e)})
+
+    return cost_usd

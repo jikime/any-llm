@@ -3,27 +3,24 @@ from typing import Annotated, Literal, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import func, Float
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from any_llm.gateway.auth import verify_jwt_or_api_key_or_master
-from any_llm.gateway.db import APIKey, Budget, CaretUser, SessionToken, UsageLog, User, get_db
+from any_llm.gateway.db import (
+    APIKey,
+    CaretUser,
+    CreditBalance,
+    SessionToken,
+    UsageLog,
+    User,
+    get_db,
+)
 from sqlalchemy import text
 from any_llm.gateway.routes.utils import resolve_target_user
 from any_llm.gateway.log_config import logger
 
 router = APIRouter(prefix="/v1/profile", tags=["profile"])
-
-
-class BudgetInfo(BaseModel):
-    """예산 정보."""
-
-    budget_id: str | None
-    max_budget: float | None
-    budget_duration_sec: int | None
-    spend: float
-    budget_started_at: str | None
-    next_budget_reset_at: str | None
 
 
 class ProfileInfo(BaseModel):
@@ -135,9 +132,10 @@ class LogsResponse(BaseModel):
     items: list[LogItem]
 
 class Balance(BaseModel):
-    """크레딧 잔액."""
+    """사용자 잔여 크레딧."""
     userId: str
     balance: float
+
 
 class BalanceResponse(BaseModel):
     """크레딧 잔액 응답."""
@@ -163,25 +161,17 @@ async def get_balance(
     # )
 
     # billing_credit_balances.total_credits를 우선, 없으면 spend 기준 0
-    balance_row = db.execute(
-        text(
-            """
-            SELECT total_credits
-            FROM billing_credit_balances
-            WHERE user_id = :uid
-            """
-        ),
-        {"uid": target_user_id},
-    ).fetchone()
-
-    total_credits = float(balance_row[0]) if balance_row and balance_row[0] is not None else 0.0
-    logger.info(f"User {target_user_id} balance: {total_credits}")
+    available_credits = db.query(func.coalesce(func.sum(CreditBalance.amount), 0.0)).filter(
+        CreditBalance.user_id == target_user_id,
+        (CreditBalance.expires_at.is_(None)) | (CreditBalance.expires_at > func.now()),
+    ).scalar() or 0.0
+    logger.info("User %s credit balance: %s", target_user_id, available_credits)
 
     return BalanceResponse(
         success=True,
         data=Balance(
             userId=target_user_id,
-            balance=total_credits * 100 * 1000, # micro dollors
+            balance=float(available_credits) * 100 * 1000, # micro dollors,
         ),
     )
 
@@ -263,6 +253,13 @@ async def get_profile(
     user_obj = db.query(User).filter(User.user_id == target_user_id).first()
     if not user_obj:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"User '{target_user_id}' not found")
+
+    session_token = (
+        db.query(SessionToken)
+        .filter(SessionToken.user_id == target_user_id, SessionToken.revoked_at.is_(None))
+        .order_by(SessionToken.created_at.desc())
+        .first()
+    )
 
     caret = db.query(CaretUser).filter(CaretUser.user_id == target_user_id).first()
 

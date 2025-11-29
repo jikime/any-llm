@@ -12,11 +12,15 @@ from any_llm import AnyLLM, LLMProvider, acompletion
 from any_llm.gateway.auth import verify_jwt_or_api_key_or_master
 from any_llm.gateway.auth.dependencies import get_config
 from any_llm.gateway.auth.vertex_auth import setup_vertex_environment
-from any_llm.gateway.budget import validate_user_budget
 from any_llm.gateway.config import GatewayConfig
-from any_llm.gateway.db import APIKey, ModelPricing, SessionToken, UsageLog, User, get_db
+from any_llm.gateway.db import APIKey, ModelPricing, SessionToken, UsageLog, User, get_db, CreditBalance
 from any_llm.gateway.log_config import logger
-from any_llm.gateway.routes.utils import resolve_target_user
+# for caret
+from any_llm.gateway.routes.utils import (
+    charge_usage_cost,
+    resolve_target_user,
+    validate_user_credit,
+)
 from any_llm.types.completion import ChatCompletion, ChatCompletionChunk, CompletionUsage
 
 router = APIRouter(prefix="/v1/chat", tags=["chat"])
@@ -84,7 +88,7 @@ async def _log_usage(
     response: ChatCompletion | AsyncIterator[ChatCompletionChunk] | None = None,
     usage_override: CompletionUsage | None = None,
     error: str | None = None,
-) -> None:
+) -> str | None:
     """Log API usage to database and update user spend.
 
     Args:
@@ -139,9 +143,11 @@ async def _log_usage(
     db.add(usage_log)
     try:
         db.commit()
+        return usage_log.id
     except Exception as e:
         logger.error(f"Failed to log usage to database: {e}")
         db.rollback()
+        return None
 
 
 @router.post("/completions", response_model=None)
@@ -167,11 +173,13 @@ async def chat_completions(
         request.user,
         missing_master_detail="When using master key, 'user' field is required in request body",
     )
-
-    _ = await validate_user_budget(db, user_id)
+    # TODO: caret
+    # _ = await validate_user_budget(db, user_id)
+    # for caret
+    validate_user_credit(db, user_id)
 
     provider, model = AnyLLM.split_model_provider(request.model)
-
+    model_key = f"{provider.value}:{model}" if provider else model
     credentials = _get_provider_credentials(config, provider)
 
     completion_kwargs = request.model_dump()
@@ -207,7 +215,8 @@ async def chat_completions(
                             completion_tokens=completion_tokens,
                             total_tokens=total_tokens,
                         )
-                        await _log_usage(
+                        # for caret
+                        usage_log_id = await _log_usage(
                             db=db,
                             api_key_obj=api_key,
                             model=model,
@@ -215,6 +224,13 @@ async def chat_completions(
                             endpoint="/v1/chat/completions",
                             user_id=user_id,
                             usage_override=usage_data,
+                        )
+                        charge_usage_cost(
+                            db,
+                            user_id=user_id,
+                            usage=usage_data,
+                            model_key=model_key,
+                            usage_id=usage_log_id,
                         )
                     else:
                         # This should never happen.
@@ -234,7 +250,8 @@ async def chat_completions(
             return StreamingResponse(generate(), media_type="text/event-stream")
 
         response: ChatCompletion = await acompletion(**completion_kwargs)  # type: ignore[assignment]
-        await _log_usage(
+        # for caret
+        usage_log_id = await _log_usage(
             db=db,
             api_key_obj=api_key,
             model=model,
@@ -242,6 +259,13 @@ async def chat_completions(
             endpoint="/v1/chat/completions",
             user_id=user_id,
             response=response,
+        )
+        charge_usage_cost(
+            db,
+            user_id=user_id,
+            usage=response.usage,
+            model_key=model_key,
+            usage_id=usage_log_id,
         )
 
     except Exception as e:

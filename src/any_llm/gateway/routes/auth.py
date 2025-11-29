@@ -13,7 +13,17 @@ from any_llm.gateway.auth import generate_api_key, hash_key, verify_jwt_or_api_k
 from any_llm.gateway.auth.dependencies import get_config
 from any_llm.gateway.auth.tokens import generate_refresh_token, hash_token, sign_access_token
 from any_llm.gateway.config import GatewayConfig
-from any_llm.gateway.db import APIKey, Budget, CaretUser, SessionToken, User, get_db
+from any_llm.gateway.db import (
+    APIKey,
+    BillingPlan,
+    BillingSubscription,
+    CaretUser,
+    CreditBalance,
+    CreditTopup,
+    SessionToken,
+    User,
+    get_db,
+)
 from any_llm.gateway.log_config import logger
 
 router = APIRouter(prefix="/v1/auth", tags=["auth"])
@@ -76,13 +86,6 @@ class LogoutRequest(BaseModel):
 
     refresh_token: str
 
-
-class BudgetInfo(BaseModel):
-    """예산 요약."""
-
-    budget_id: str
-    max_budget: float | None
-    budget_duration_sec: int | None
 
 
 class TokenBundle(BaseModel):
@@ -221,45 +224,72 @@ def jwt_exp(token: str) -> int:
 
 
 def _ensure_free_plan_and_balance(db: Session, user_id: str, now: datetime) -> None:
-    """신규 사용자 기본 구독/크레딧 생성."""
-    start_at = now
-    renew_at = now + timedelta(days=30)
+    """Seed free subscription plan/subscription and credit pools for new users."""
+    plan = db.query(BillingPlan).filter(BillingPlan.name == "FREE").first()
+    if not plan:
+        plan = BillingPlan(
+            name="FREE",
+            monthly_credits=10.0,
+            price_usd=0.0,
+            currency="USD",
+            credits_per_usd=10.0,
+            renew_interval_days=30,
+            features={},
+            active=True,
+        )
+        db.add(plan)
+        db.flush()
 
-    db.execute(
-        text(
-            """
-            INSERT INTO billing_subscription_plans
-                (id, user_id, plan_code, status, credits_per_month, price_cents, currency, start_at, renew_at, ends_at, created_at, updated_at)
-            VALUES
-                (:id, :user_id, 'FREE', 'ACTIVE', 10, 0, 'USD', :start_at, :renew_at, :renew_at, :created_at, :updated_at)
-            ON CONFLICT (user_id) DO NOTHING
-            """
-        ),
-        {
-            "id": str(uuid.uuid4()),
-            "user_id": user_id,
-            "start_at": start_at,
-            "renew_at": renew_at,
-            "created_at": now,
-            "updated_at": now,
-        },
+    subscription = (
+        db.query(BillingSubscription)
+        .filter(BillingSubscription.user_id == user_id, BillingSubscription.status == "ACTIVE")
+        .first()
     )
-    db.execute(
-        text(
-            """
-            INSERT INTO billing_credit_balances
-                (user_id, total_credits, used_credits, subscription_credits, extra_credits, gift_subscription_credits, gift_extra_credits, currency, created_at, updated_at)
-            VALUES
-                (:user_id, 10, 0, 10, 0, 0, 0, 'USD', :created_at, :updated_at)
-            ON CONFLICT (user_id) DO NOTHING
-            """
-        ),
-        {
-            "user_id": user_id,
-            "created_at": now,
-            "updated_at": now,
-        },
+    if not subscription:
+        subscription = BillingSubscription(
+            user_id=user_id,
+            plan_id=plan.id,
+            status="ACTIVE",
+            start_at=now,
+            renew_at=now + timedelta(days=int(plan.renew_interval_days)),
+        )
+        db.add(subscription)
+
+    expires_at = now + timedelta(days=int(plan.renew_interval_days))
+    balance = (
+        db.query(CreditBalance)
+        .filter(CreditBalance.user_id == user_id, CreditBalance.pool_type == "SUBSCRIPTION")
+        .order_by(CreditBalance.created_at.desc())
+        .first()
     )
+    if not balance:
+        balance = CreditBalance(
+            user_id=user_id,
+            pool_type="SUBSCRIPTION",
+            source_id=plan.id,
+            amount=float(plan.monthly_credits),
+            expires_at=expires_at,
+            priority=2,
+        )
+        db.add(balance)
+    else:
+        balance.amount = float(plan.monthly_credits)
+        balance.expires_at = expires_at
+        balance.priority = 2
+        balance.source_id = plan.id
+
+    topup = CreditTopup(
+        user_id=user_id,
+        pool_type="SUBSCRIPTION",
+        amount=float(plan.monthly_credits),
+        amount_usd=0.0,
+        credits_per_usd=float(plan.credits_per_usd),
+        expires_at=expires_at,
+        source="SUBSCRIPTION_RENEWAL",
+        reference_id=plan.id,
+        metadata_={"seeded": True},
+    )
+    db.add(topup)
 
 
 @router.get("/authorize", response_model=AuthorizeResponse)
@@ -293,8 +323,7 @@ async def exchange_token(
 
     session: SessionToken | None = (
         db.query(SessionToken, CaretUser)
-        .join(User, User.user_id == SessionToken.user_id)
-        .join(CaretUser, CaretUser.user_id == User.user_id, isouter=True)
+        .join(CaretUser, CaretUser.user_id == SessionToken.user_id, isouter=True)
         .filter(SessionToken.provider_token == request.code)
         .order_by(SessionToken.created_at.desc())
         .first()
@@ -347,25 +376,17 @@ async def social_login(
     caret_user = db.query(CaretUser).filter(CaretUser.provider == profile["provider"]).first()
 
     is_new_user = caret_user is None
-    budget: Budget
     user: User
     api_key: APIKey
     raw_api_key: str | None = None
 
     if is_new_user:
-        budget = Budget(max_budget=1.0, budget_duration_sec=2_592_000)
-        db.add(budget)
-        db.flush()
-
         now = datetime.now(UTC)
         user = User(
             user_id=str(uuid.uuid4()),
             alias=profile.get("name"),
-            budget_id=budget.budget_id,
             blocked=False,
             metadata_=request.metadata,
-            budget_started_at=now,
-            next_budget_reset_at=now + timedelta(days=30),
         )
         db.add(user)
         db.flush()
@@ -423,8 +444,7 @@ async def refresh_token(
     logger.info("refresh_token hash=%s", refresh_hash)
     session = (
         db.query(SessionToken, CaretUser)
-        .join(User, User.user_id == SessionToken.user_id)
-        .join(CaretUser, CaretUser.user_id == User.user_id, isouter=True)
+        .join(CaretUser, CaretUser.user_id == SessionToken.user_id, isouter=True)
         .filter(SessionToken.refresh_token_hash == refresh_hash)
         .first()
     )

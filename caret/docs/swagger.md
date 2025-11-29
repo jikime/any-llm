@@ -4,7 +4,14 @@
 - `server.py` 설정:
   - `swagger_ui_parameters={"persistAuthorization": True}`로 Authorize 입력을 유지한다.
   - `CORSMiddleware`는 `*` 오리진/헤더/메서드를 허용한다.
-  - 루트(`/`) 접속 시 `/docs`로 리디렉트한다.
+- 루트(`/`) 접속 시 `/docs`로 리디렉트한다.
+
+## `server.py` 진입점
+
+- `create_app(config: GatewayConfig)`는 `init_db()`로 데이터베이스를 초기화하고 `set_config()`을 통해 전역 구성에 접근할 수 있게 한다.
+- `initialize_pricing_from_config()`으로 `ModelPricing`을 `config.yml`에서 바로 채운 다음 FastAPI 애플리케이션을 생성한다.
+- `CORSMiddleware`, `/docs` 리디렉트, `chat`, `auth`, `users`, `budgets`, `pricing`, `profile`, `keys`, `health` 등 모든 라우터를 포함한다.
+- `any-llm-gateway serve` 커맨드는 내부적으로 이 `create_app()`을 호출하므로 `server.py`를 직접 편집하면 실행 흐름을 변경할 수 있다.
 
 ## 실행 예시
 
