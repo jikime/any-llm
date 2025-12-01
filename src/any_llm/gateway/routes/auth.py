@@ -60,6 +60,7 @@ class RefreshRequest(BaseModel):
     """토큰 갱신 요청."""
 
     refreshToken: str
+    source: str | None = None
 
 
 class TokenRequest(BaseModel):
@@ -455,8 +456,12 @@ async def refresh_token(
     caret_row: CaretUser | None = session.CaretUser
 
     now = datetime.now(UTC)
-    if session_row.revoked_at:
-        logger.info("refresh_token denied: revoked session_id=%s", session_row.id)
+    if session_row.revoked_at and request.source != "home":
+        logger.info(
+            "refresh_token denied: revoked session_id=%s source=%s",
+            session_row.id,
+            request.source,
+        )
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token revoked")
     if session_row.refresh_expires_at and session_row.refresh_expires_at < now:
         logger.info(
