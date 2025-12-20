@@ -1,7 +1,9 @@
 import base64
+import json
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -26,6 +28,7 @@ class GenerateImageRequest(BaseModel):
     model: str | None = None
     aspect_ratio: str | None = None
     image_size: str | None = None
+    stream: bool = False
 
 
 class GenerateImageResponse(BaseModel):
@@ -55,7 +58,7 @@ async def generate_image(
     ],
     db: Annotated[Session, Depends(get_db)],
     config: Annotated[GatewayConfig, Depends(get_config)],
-) -> GenerateImageResponse:
+) -> GenerateImageResponse | StreamingResponse:
     """Generate a single image and return it as base64."""
     _user_id = resolve_target_user(
         auth_result,
@@ -93,10 +96,112 @@ async def generate_image(
         config_kwargs["thinking_config"] = genai.types.ThinkingConfig(
             include_thoughts=True
         )
+        content_config = genai.types.GenerateContentConfig(**config_kwargs)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Image generation failed: {e!s}",
+        ) from e
+
+    def _iter_parts(chunk) -> list[object]:
+        parts = getattr(chunk, "parts", None)
+        if parts:
+            return parts
+        candidates = getattr(chunk, "candidates", None)
+        if candidates:
+            content = getattr(candidates[0], "content", None)
+            parts = getattr(content, "parts", None)
+            if parts:
+                return parts
+        return []
+
+    def _format_sse_event(payload: dict[str, object]) -> str:
+        return f"data: {json.dumps(payload)}\n\n"
+
+    if request.stream:
+        try:
+            if hasattr(client.models, "generate_content_stream"):
+                stream = client.models.generate_content_stream(
+                    model=model_id,
+                    contents=[request.prompt],
+                    config=content_config,
+                )
+            else:
+                stream = client.models.generate_content(
+                    model=model_id,
+                    contents=[request.prompt],
+                    config=content_config,
+                    stream=True,
+                )
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"Image generation failed: {e!s}",
+            ) from e
+
+        def event_stream(client_ref=client, stream_ref=stream):
+            try:
+                for chunk in stream_ref:
+                    for part in _iter_parts(chunk):
+                        text_value = getattr(part, "text", None)
+                        if isinstance(text_value, str) and text_value:
+                            if getattr(part, "thought", False):
+                                yield _format_sse_event(
+                                    {"type": "thought", "content": text_value}
+                                )
+                            else:
+                                yield _format_sse_event(
+                                    {"type": "text", "content": text_value}
+                                )
+
+                        inline_data = getattr(part, "inline_data", None)
+                        data = (
+                            getattr(inline_data, "data", None)
+                            if inline_data is not None
+                            else None
+                        )
+                        candidate_mime_type = (
+                            getattr(inline_data, "mime_type", None)
+                            if inline_data is not None
+                            else None
+                        )
+                        if not data:
+                            continue
+                        if isinstance(data, bytearray):
+                            data = bytes(data)
+                        if not isinstance(data, bytes):
+                            continue
+                        if (
+                            isinstance(candidate_mime_type, str)
+                            and candidate_mime_type.startswith("image/")
+                        ):
+                            mime_type = candidate_mime_type
+                        else:
+                            mime_type = "image/png"
+                        base64_str = base64.b64encode(data).decode("utf-8")
+                        yield _format_sse_event(
+                            {
+                                "type": "image",
+                                "mimeType": mime_type,
+                                "base64": base64_str,
+                            }
+                        )
+                yield _format_sse_event({"type": "done"})
+            except Exception as e:
+                yield _format_sse_event({"type": "error", "message": str(e)})
+            finally:
+                try:
+                    client_ref.close()
+                except Exception:
+                    pass
+
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+    try:
         resp = client.models.generate_content(
             model=model_id,
             contents=[request.prompt],
-            config=genai.types.GenerateContentConfig(**config_kwargs),
+            config=content_config,
         )
     except Exception as e:
         raise HTTPException(
