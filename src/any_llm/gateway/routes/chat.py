@@ -190,7 +190,7 @@ async def _log_usage(
         usage_log.prompt_tokens = usage_data.prompt_tokens
         usage_log.completion_tokens = usage_data.completion_tokens
         usage_log.total_tokens = usage_data.total_tokens
-        usage_log.cached_tokens = _get_cached_prompt_tokens(usage_data)
+        usage_log.cached_tokens = getattr(usage_data, "cached_tokens", 0) or 0
 
         resolved_model_key = model_key or _build_model_key(provider, model)
         pricing = model_pricing
@@ -206,7 +206,7 @@ async def _log_usage(
                 if user:
                     user.spend = float(user.spend) + cost
         else:
-            logger.warning(f"No pricing configured for model '{resolved_model_key}'. Usage will be tracked without cost.")
+            logger.info(f"No pricing configured for model '{resolved_model_key}'. Usage will be tracked without cost.")
 
     db.add(usage_log)
     try:
@@ -253,6 +253,8 @@ async def chat_completions(
     completion_kwargs = request.model_dump()
     completion_kwargs.update(credentials)
 
+    logger.info("request data %s", request)
+
     try:
         if request.stream:
 
@@ -262,6 +264,7 @@ async def chat_completions(
                 total_tokens = 0
                 cached_tokens = 0
                 cached_tokens_seen = False
+                saw_finish_reason = False
 
                 try:
                     stream: AsyncIterator[ChatCompletionChunk] = await acompletion(**completion_kwargs)  # type: ignore[assignment]
@@ -269,6 +272,7 @@ async def chat_completions(
                         if chunk.usage:
                             chunk.usage = _maybe_attach_cost_to_usage(chunk.usage, model_pricing)
 
+                        logger.info("Chunk: %s", chunk)
                         if chunk.usage:
                             # Prompt tokens should be constant, take first non-zero value
                             if chunk.usage.prompt_tokens and not prompt_tokens:
@@ -282,7 +286,12 @@ async def chat_completions(
                                 cached_tokens_seen = True
                                 cached_tokens = max(cached_tokens, cached_tokens_value or 0)
 
+                        if chunk.choices and any(choice.finish_reason for choice in chunk.choices):
+                            saw_finish_reason = True
+
                         yield f"data: {chunk.model_dump_json()}\n\n"
+                        if saw_finish_reason:
+                            break
                     yield "data: [DONE]\n\n"
 
                     # Log aggregated usage
@@ -301,6 +310,7 @@ async def chat_completions(
                                 except Exception:
                                     pass
                         # for caret
+                        logger.info("Usage data: %s", json.dumps(usage_data.model_dump()))
                         usage_log_id = await _log_usage(
                             db=db,
                             api_key_obj=api_key,
@@ -336,7 +346,15 @@ async def chat_completions(
                     )
                     raise
 
-            return StreamingResponse(generate(), media_type="text/event-stream")
+            return StreamingResponse(
+                generate(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
 
         response: ChatCompletion = await acompletion(**completion_kwargs)  # type: ignore[assignment]
         # for caret
